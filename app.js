@@ -269,6 +269,40 @@ function getCompletedExamKeysForUser(){
   const fromUser = normalizeExamList(currentUser.completedExams || remoteParticipantState?.completedExams || '');
   return Array.from(new Set([...fromResults, ...fromUser]));
 }
+function inferPackageFromCompletedHistory(){
+  if(!currentUser) return '';
+  const participantKey=normalizeNoUjian(currentUser.participantKey || currentUser.noUjian || currentUser.username || currentUser.name);
+  const relevantResults=getResults().filter(r=>normalizeNoUjian(r.participantKey || r.noUjian || r.username || r.name)===participantKey);
+  const explicitPackages=Array.from(new Set(relevantResults.map(r=>normalizePackageKey(r.examPackage || r.package || r.paket || '')).filter(Boolean)));
+  if(explicitPackages.length===1) return explicitPackages[0];
+  if(explicitPackages.length>1) return '';
+  const completed=getCompletedExamKeysForUser();
+  const hasArabic=completed.includes('arabic');
+  const hasEnglish=completed.includes('english');
+  if(hasArabic && !hasEnglish) return 'arabic_math';
+  if(hasEnglish && !hasArabic) return 'english_math';
+  return '';
+}
+function applyLockedPackageState(key, state=null){
+  const normalized=normalizePackageKey(key || state?.package || state?.examPackage || '');
+  if(!currentUser || !normalized) return false;
+  currentUser.examPackage=normalized;
+  if(state?.completedExams) currentUser.completedExams=normalizeExamList(state.completedExams);
+  remoteParticipantState=state || remoteParticipantState;
+  localStorage.setItem(packageStorageKey(), normalized);
+  saveLoginSession();
+  return true;
+}
+async function recoverUserPackageFromHistory(){
+  if(!currentUser || currentUser.role==='admin' || getUserPackage()) return false;
+  const completed=getCompletedExamKeysForUser();
+  if(!completed.length) return false;
+  const inferred=inferPackageFromCompletedHistory();
+  if(!inferred) return false;
+  const locked=await lockPackageRemote(inferred,{recoverHistory:true});
+  if(!locked.ok) return false;
+  return applyLockedPackageState(inferred, locked.state);
+}
 function getRemoteOnlyCompletedResults(){
   if(!currentUser) return [];
   const localKeys = new Set(getResults()
@@ -292,16 +326,22 @@ async function setUserPackage(key){
   if(!EXAM_PACKAGES[key]) return;
   const latest = await refreshParticipantState(false);
   const fixedPackage = normalizePackageKey(latest?.package || getUserPackage());
+  const completedHistory=getCompletedExamKeysForUser();
+  const inferredPackage=inferPackageFromCompletedHistory();
   if(fixedPackage && fixedPackage !== key){
     await showAlertMessage('Paket Sudah Terkunci', `Nomor ujian ini sudah terkunci pada ${EXAM_PACKAGES[fixedPackage].subtitle}. Admin harus reset peserta jika paket perlu diganti.`);
     renderDashboard();
     return;
   }
-  if(packageIsFixedByAccount() && getUserPackage() && getUserPackage() !== key) return;
-  if(getCompletedExamKeysForUser().length){
-    await showAlertMessage('Paket Tidak Dapat Diganti', 'Pilihan paket tidak dapat diganti karena sudah ada ujian yang dikerjakan.');
+  if(inferredPackage && inferredPackage !== key){
+    await showAlertMessage('Paket Tidak Dapat Diganti', `Riwayat ujian menunjukkan bahwa nomor ujian ini sudah memakai ${EXAM_PACKAGES[inferredPackage].subtitle}. Lanjutkan paket tersebut atau hubungi admin untuk reset seluruh peserta.`);
+    renderDashboard();
     return;
   }
+  if(packageIsFixedByAccount() && getUserPackage() && getUserPackage() !== key) return;
+  // Riwayat ujian tidak boleh memblokir peserta ketika ia membuka kembali paket
+  // yang sama untuk melanjutkan mata pelajaran kedua. Backend tetap menjadi
+  // sumber kebenaran dan akan menolak jika paket yang dipilih berbeda.
   const pkg=EXAM_PACKAGES[key];
   const detail=pkg.exams.map(k=>`${examTitleByKey(k)} · ${EXAMS[k].questions.length} soal · ${EXAMS[k].durationMinutes} menit`).join('<br>');
   const ok=await showActionModal({
@@ -311,18 +351,14 @@ async function setUserPackage(key){
     cancelText:'Batal'
   });
   if(!ok) return;
-  const locked = await lockPackageRemote(key);
+  const locked = await lockPackageRemote(key,{recoverHistory:completedHistory.length>0});
   if(!locked.ok){
     await showAlertMessage('Paket Gagal Dikunci', locked.message || 'Sistem belum berhasil mengunci paket. Coba lagi atau hubungi admin.');
     await refreshParticipantState(false);
     renderDashboard();
     return;
   }
-  currentUser.examPackage=key;
-  if(locked.state?.completedExams) currentUser.completedExams=locked.state.completedExams;
-  remoteParticipantState=locked.state || remoteParticipantState;
-  localStorage.setItem(packageStorageKey(), key);
-  saveLoginSession();
+  applyLockedPackageState(key, locked.state);
   renderDashboard();
 }
 function getCompletedExamsForUser(){
@@ -646,16 +682,17 @@ async function refreshParticipantState(showError=false){
     return null;
   }
 }
-async function lockPackageRemote(key){
+async function lockPackageRemote(key, options={}){
   if(!SHEETS_WEB_APP_URL) {
-    return {ok:true, state:{package:key, completedExams:[]}, message:'Mode lokal. Kunci lintas perangkat aktif setelah Google Sheets dihubungkan.'};
+    return {ok:true, state:{package:key, completedExams:getCompletedExamKeysForUser()}, message:'Mode lokal. Kunci lintas perangkat aktif setelah Google Sheets dihubungkan.'};
   }
   try{
     const data=await apiGet('lockPackage',{
       noUjian:currentUser.noUjian || currentUser.username,
       username:currentUser.username || currentUser.noUjian,
       name:currentUser.name || '',
-      package:key
+      package:key,
+      recoverHistory:options.recoverHistory ? '1' : ''
     });
     if(data.ok && data.participant){
       return {ok:true, state:applyParticipantState(data.participant)};
@@ -792,7 +829,8 @@ function restoreLoginSession(){
     renderDashboard();
   }
   if(currentUser.role!=='admin'){
-    refreshParticipantState(false).then(()=>{
+    refreshParticipantState(false).then(async()=>{
+      await recoverUserPackageFromHistory();
       if(currentUser && currentUser.role!=='admin' && !currentExam) {
         setUserHeader(currentUser);
         renderDashboard();
@@ -861,6 +899,7 @@ async function enterApp(user){
     $('loginSubmitBtn').disabled=true;
     $('loginSubmitBtn').textContent='Memeriksa status...';
     await refreshParticipantState(false);
+    await recoverUserPackageFromHistory();
     $('loginSubmitBtn').disabled=false;
     $('loginSubmitBtn').textContent='Masuk ke Pilihan Paket';
   }
