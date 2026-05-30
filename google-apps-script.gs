@@ -1,3 +1,4 @@
+// PMB Backend v2026-05-30.4 - WIB, urut nomor ujian, reset lintas perangkat, dan pemulihan paket lanjutan
 const ADMIN_PASSWORD_DEFAULT = ''; // Fail-closed: isi Script Property ADMIN_PASSWORD sebelum digunakan.
 const JAKARTA_TIME_ZONE = 'Asia/Jakarta';
 const WIB_OFFSET = '+07:00';
@@ -41,7 +42,7 @@ function parseDate_(value) {
 }
 
 function jakartaIso_(value) {
-  return Utilities.formatDate(parseDate_(value), JAKARTA_TIME_ZONE, "yyyy-MM-dd'T'HH:mm:ss") + WIB_OFFSET;
+  return Utilities.formatDate(parseDate_(value), JAKARTA_TIME_ZONE, "yyyy-MM-dd'T'HH:mm:ss.SSS") + WIB_OFFSET;
 }
 
 function naturalParts_(value) {
@@ -292,6 +293,82 @@ function completedExamKeysFromResults_(noUjian) {
   return Array.from(new Set(keys));
 }
 
+// Membaca jejak hasil lama ketika sheet Peserta PMB belum sinkron.
+// Fallback ini hanya dipakai pada operasi administratif atau migrasi,
+// sehingga login peserta normal tetap ringan untuk penggunaan massal.
+function inferPackageFromResultRows_(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const explicitPackages = Array.from(new Set(
+    list.map(r => normalizePackage_(r.examPackage || r.package || '')).filter(Boolean)
+  ));
+  const completedExams = Array.from(new Set(
+    list.map(r => String(r.examKey || '').trim()).filter(Boolean)
+  ));
+  const hasArabic = completedExams.indexOf('arabic') !== -1;
+  const hasEnglish = completedExams.indexOf('english') !== -1;
+  let packageKey = explicitPackages.length === 1 ? explicitPackages[0] : '';
+  let conflict = explicitPackages.length > 1;
+
+  if (!packageKey && !conflict) {
+    if (hasArabic && !hasEnglish) packageKey = 'arabic_math';
+    if (hasEnglish && !hasArabic) packageKey = 'english_math';
+  }
+  if (hasArabic && hasEnglish) conflict = true;
+
+  return {package: packageKey, completedExams, conflict};
+}
+
+function participantResultSnapshot_(noUjian) {
+  const no = normalizeNo_(noUjian);
+  const rows = resultRows_().filter(r => normalizeNo_(r.noUjian || r.username) === no);
+  const inferred = inferPackageFromResultRows_(rows);
+  return {rows, package: inferred.package, completedExams: inferred.completedExams, conflict: inferred.conflict};
+}
+
+function unionExamKeys_(left, right) {
+  return Array.from(new Set([
+    ...normalizeExamList_(left || []),
+    ...normalizeExamList_(right || [])
+  ].filter(Boolean)));
+}
+
+// Jalankan satu kali setelah upgrade apabila sebelumnya sudah ada hasil ujian.
+// Fungsi ini mengisi ulang Paket dan Completed Exams pada sheet Peserta PMB
+// berdasarkan data Hasil PMB tanpa mengubah nilai peserta.
+function sinkronkanDataPesertaPMB() {
+  const rows = resultRows_();
+  const grouped = {};
+  rows.forEach(r => {
+    const no = normalizeNo_(r.noUjian || r.username || '');
+    if (!no) return;
+    if (!grouped[no]) grouped[no] = [];
+    grouped[no].push(r);
+  });
+
+  const participantSheet = getOrCreateSheet_('Peserta PMB', PARTICIPANT_HEADERS);
+  let repaired = 0;
+  Object.keys(grouped).forEach(no => {
+    const current = getParticipant_(no, grouped[no][0] && grouped[no][0].name || '');
+    const inferred = inferPackageFromResultRows_(grouped[no]);
+    if (inferred.conflict) return;
+    const packageKey = current.package || inferred.package || '';
+    const completedExams = unionExamKeys_(current.completedExams, inferred.completedExams);
+    writeParticipant_(participantSheet, {
+      noUjian:no,
+      username:current.username || no,
+      name:current.name || (grouped[no][0] && grouped[no][0].name) || '',
+      package:packageKey,
+      completedExams,
+      status:current.status && current.status !== 'NEW' ? current.status : 'SYNCED_FROM_RESULTS',
+      lockedAt:current.lockedAt || (packageKey ? jakartaIso_() : ''),
+      lastSubmittedAt:current.lastSubmittedAt || (grouped[no][grouped[no].length - 1] && grouped[no][grouped[no].length - 1].submittedAt) || '',
+      notes:'Participant state synchronized from Hasil PMB'
+    });
+    repaired++;
+  });
+  return repaired;
+}
+
 function getParticipant_(noUjian, name) {
   const no = normalizeNo_(noUjian);
   const sheet = getOrCreateSheet_('Peserta PMB', PARTICIPANT_HEADERS);
@@ -392,6 +469,12 @@ function handleResult_(data) {
     const incomingPackage = normalizePackage_(data.examPackage || participant.package || '');
     const finalPackage = participant.package || incomingPackage;
 
+    // Hasil tanpa paket membuat reset per mapel tidak dapat diverifikasi.
+    // Tolak secara fail-closed agar data baru selalu konsisten.
+    if (!finalPackage) {
+      return output_({ok:false, type:'result', error:'Paket peserta belum terkunci. Kembali ke halaman paket, pilih paket, lalu mulai ulang ujian.'});
+    }
+
     if (participant.package && incomingPackage && participant.package !== incomingPackage) {
       return output_({ok:false, type:'result', error:'Paket peserta tidak sesuai dengan paket yang sudah terkunci.'});
     }
@@ -469,12 +552,41 @@ function handleLockPackage_(params) {
   try {
     const sheet = getOrCreateSheet_('Peserta PMB', PARTICIPANT_HEADERS);
     const current = getParticipant_(no, params.name || '');
-    if (current.package && current.package !== packageKey) {
+    // Jalur normal peserta baru tidak membaca seluruh rekap hasil agar tetap ringan.
+    // Pemulihan otomatis hanya dilakukan jika baris peserta lama terlihat tidak sinkron.
+    const needsRecovery = !current.package && (
+      String(params.recoverHistory || '') === '1' ||
+      (current.completedExams || []).length > 0 ||
+      (current.status && current.status !== 'NEW' && current.status !== 'RESET_BY_ADMIN')
+    );
+    const snapshot = needsRecovery
+      ? participantResultSnapshot_(no)
+      : {rows:[], package:'', completedExams:[], conflict:false};
+    const recoveredPackage = current.package || snapshot.package || '';
+    const recoveredCompleted = unionExamKeys_(current.completedExams, snapshot.completedExams);
+
+    if (snapshot.conflict) {
+      return output_({
+        ok:false,
+        type:'lockPackage',
+        error:'Data paket peserta tidak konsisten. Hubungi admin untuk melakukan reset seluruh peserta.',
+        participant:current
+      });
+    }
+    if (recoveredPackage && recoveredPackage !== packageKey) {
       return output_({
         ok:false,
         type:'lockPackage',
         error:'Nomor ujian ini sudah terkunci pada paket lain. Hubungi admin untuk reset.',
-        participant:current
+        participant:{...current, package:recoveredPackage, completedExams:recoveredCompleted}
+      });
+    }
+    if (!recoveredPackage && recoveredCompleted.length) {
+      return output_({
+        ok:false,
+        type:'lockPackage',
+        error:'Riwayat ujian lama ditemukan tetapi paketnya belum dapat dipastikan. Hubungi admin untuk reset seluruh peserta.',
+        participant:{...current, completedExams:recoveredCompleted}
       });
     }
     const now = jakartaIso_();
@@ -482,8 +594,8 @@ function handleLockPackage_(params) {
       noUjian:no,
       username:params.username || no,
       name:params.name || current.name || '',
-      package:packageKey,
-      completedExams:current.completedExams || [],
+      package:recoveredPackage || packageKey,
+      completedExams:recoveredCompleted,
       status:'LOCKED',
       lockedAt:current.lockedAt || now,
       lastStartedAt:now,
@@ -548,21 +660,32 @@ function handleResetExam_(params) {
   lock.waitLock(12000);
   try {
     const sheet = getOrCreateSheet_('Peserta PMB', PARTICIPANT_HEADERS);
-    const current = getParticipant_(no, '');
-    if (!current.package) {
-      return output_({ok:false, type:'resetExam', error:'Peserta belum memiliki paket yang terkunci.'});
+    const stored = getParticipant_(no, '');
+    const snapshot = participantResultSnapshot_(no);
+    const recoveredPackage = stored.package || snapshot.package || '';
+    const completedBeforeReset = unionExamKeys_(stored.completedExams, snapshot.completedExams);
+
+    if (snapshot.conflict) {
+      return output_({ok:false, type:'resetExam', error:'Data paket peserta tidak konsisten. Gunakan reset seluruh peserta untuk membuka ulang dari awal.'});
     }
-    if (!packageAllowsExam_(current.package, examKey)) {
+    if (!recoveredPackage && snapshot.rows.length === 0 && completedBeforeReset.length === 0) {
+      return output_({ok:false, type:'resetExam', error:'Belum ada hasil mata pelajaran yang dapat di-reset untuk nomor ujian ini.'});
+    }
+    if (recoveredPackage && !packageAllowsExam_(recoveredPackage, examKey)) {
       return output_({ok:false, type:'resetExam', error:'Mata pelajaran tidak termasuk dalam paket peserta.'});
     }
+    if (!recoveredPackage && completedBeforeReset.indexOf(examKey) === -1) {
+      return output_({ok:false, type:'resetExam', error:'Paket peserta belum dapat dipastikan dan mata pelajaran ini belum tercatat. Gunakan reset seluruh peserta.'});
+    }
+
     const deleted = deleteResultsForParticipantExam_(no, examKey);
     const now = jakartaIso_();
-    const completed = (current.completedExams || []).filter(key => key !== examKey);
+    const completed = completedBeforeReset.filter(key => key !== examKey);
     const updated = writeParticipant_(sheet, {
       noUjian:no,
-      username:current.username || no,
-      name:current.name || '',
-      package:current.package,
+      username:stored.username || no,
+      name:stored.name || '',
+      package:recoveredPackage,
       completedExams:completed,
       status:'RESET_EXAM_BY_ADMIN',
       lastStartedAt:'',
