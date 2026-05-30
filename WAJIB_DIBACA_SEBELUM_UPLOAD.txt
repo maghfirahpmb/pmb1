@@ -1,0 +1,13 @@
+LANGKAH WAJIB SETELAH DOWNLOAD
+
+1. Buka config.js dan ISI password admin serta password peserta. Nilainya sengaja kosong agar password lama langsung tidak berlaku.
+2. Tempel google-apps-script.gs terbaru ke Apps Script.
+3. Samakan Script Property ADMIN_PASSWORD dengan adminPassword di config.js.
+4. Deploy Apps Script sebagai New version.
+5. Upload semua file proyek ke GitHub.
+6. Hapus file PNG banner lama dan database/accounts.csv dari GitHub jika masih ada.
+7. Tes password lama: harus sudah tidak dapat dipakai.
+8. Tes reset satu mata pelajaran sebelum ujian resmi.
+
+9. Versi ini memakai WIB (Asia/Jakarta) untuk seluruh waktu ujian dan submit.
+10. Hasil pada Sheet "Hasil PMB" akan tersusun berdasarkan Nomor Ujian secara otomatis.
