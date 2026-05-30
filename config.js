@@ -4,8 +4,8 @@ window.PMB_CONFIG = {
 
   // Ubah password HANYA di file ini agar password lama tidak ikut aktif dari file lain.
   // Setelah mengganti adminPassword, samakan juga Script Property ADMIN_PASSWORD di Apps Script.
-  adminPassword: "",
-  candidatePassword: "",
+  adminPassword: "adminstipi2026",
+  candidatePassword: "stipi2026",
 
   // Seluruh waktu ujian, submit, reset, dan dashboard menggunakan WIB (Asia/Jakarta).
   timeZone: "Asia/Jakarta",
