@@ -1,6 +1,6 @@
 window.PMB_CONFIG = {
   // Google Apps Script Web App URL setelah deploy.
-  sheetsWebAppUrl: "https://script.google.com/macros/s/AKfycbzsL_XYU1bunFXr6sJ9DVpz1uJC4fN0JHddBM8asDckSkfn_yVwPSGMXkgwEI206dX7iw/exec",
+  sheetsWebAppUrl: "https://script.google.com/macros/s/AKfycbx-eVcaBmjSkrYuYoykN4YEGaEDwDbADAHTLfoy0dOEt_Uw9A678_YhN-87rxD88D3n/exec",
 
   // Ubah password HANYA di file ini agar password lama tidak ikut aktif dari file lain.
   // Setelah mengganti adminPassword, samakan juga Script Property ADMIN_PASSWORD di Apps Script.
